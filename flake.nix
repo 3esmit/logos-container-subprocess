@@ -4,7 +4,7 @@
   inputs = {
     logos-nix.url = "github:logos-co/logos-nix";
     nixpkgs.follows = "logos-nix/nixpkgs";
-    logos-container.url = "github:logos-co/logos-container";
+    logos-container.url = "github:3esmit/logos-container";
   };
 
   outputs = { self, nixpkgs, logos-nix, logos-container }:

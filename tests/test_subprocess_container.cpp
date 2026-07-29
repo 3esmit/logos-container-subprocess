@@ -41,6 +41,21 @@ static bool launchFakeModule(SubprocessContainer& c, const char* name,
     return c.launch(desc, "/bin/sh", {"-c", "exec sleep 5"}, nullptr, handle);
 }
 
+static LogosCore::ModuleDescriptor scopedDescriptor(const char* instanceId) {
+    LogosCore::ModuleDescriptor desc;
+    desc.name = "lez_indexer_module";
+    desc.instanceId = instanceId;
+    return desc;
+}
+
+static bool launchFakeInstance(SubprocessContainer& c,
+                               const LogosCore::ModuleDescriptor& desc,
+                               LogosCore::LoadedModuleHandle& handle,
+                               std::function<void(const LogosCore::ModuleAddress&)> onTerminated = {}) {
+    return c.launchInstance(desc, "/bin/sh", {"-c", "exec sleep 5"},
+                            std::move(onTerminated), handle);
+}
+
 // ---------------------------------------------------------------------------
 // canHandle: subprocess container accepts any module descriptor
 // ---------------------------------------------------------------------------
@@ -137,6 +152,235 @@ TEST_F(SubprocessContainerTest, GetAllPids_ReturnsAllRunningPids) {
     EXPECT_GT(pids.at("gp_a"), 0);
     EXPECT_GT(pids.at("gp_b"), 0);
     EXPECT_NE(pids.at("gp_a"), pids.at("gp_b"));
+}
+
+TEST_F(SubprocessContainerTest, StartProcess_PromotesDefaultPlaceholder) {
+    SubprocessContainer::registerProcess("placeholder_start");
+    ASSERT_TRUE(SubprocessContainer::hasProcess("placeholder_start"));
+    ASSERT_TRUE(SubprocessContainer::startProcess(
+        "placeholder_start", "/bin/sh", {"-c", "exec sleep 5"}, {}));
+
+    EXPECT_GT(SubprocessContainer::getProcessId("placeholder_start"), 0);
+}
+
+TEST_F(SubprocessContainerTest, Terminate_RemovesDefaultPlaceholder) {
+    SubprocessContainer::registerProcess("placeholder_terminate");
+    ASSERT_TRUE(SubprocessContainer::hasProcess("placeholder_terminate"));
+
+    container.terminate("placeholder_terminate");
+
+    EXPECT_FALSE(SubprocessContainer::hasProcess("placeholder_terminate"));
+}
+
+// ---------------------------------------------------------------------------
+// Scoped instances: same logical module, separate process identities
+// ---------------------------------------------------------------------------
+
+TEST_F(SubprocessContainerTest, LaunchInstance_KeepsSameNameZonesIndependent) {
+    const LogosCore::ModuleDescriptor lez = scopedDescriptor("zone_0101");
+    const LogosCore::ModuleDescriptor paradox = scopedDescriptor("zone_8888");
+    LogosCore::LoadedModuleHandle lezHandle;
+    LogosCore::LoadedModuleHandle paradoxHandle;
+
+    ASSERT_TRUE(launchFakeInstance(container, lez, lezHandle));
+    ASSERT_TRUE(launchFakeInstance(container, paradox, paradoxHandle));
+
+    EXPECT_EQ(lezHandle.address(), lez.address());
+    EXPECT_EQ(paradoxHandle.address(), paradox.address());
+    EXPECT_NE(lezHandle.pid, paradoxHandle.pid);
+    EXPECT_TRUE(container.hasInstance(lez.address()));
+    EXPECT_TRUE(container.hasInstance(paradox.address()));
+    EXPECT_FALSE(container.hasModule(lez.name));
+
+    const auto all = container.getAllInstancePids();
+    EXPECT_EQ(all.size(), 2u);
+    EXPECT_EQ(all.at(lez.address()), lezHandle.pid);
+    EXPECT_EQ(all.at(paradox.address()), paradoxHandle.pid);
+    EXPECT_TRUE(container.getAllPids().empty());
+
+    ASSERT_TRUE(container.terminateInstance(lez.address()));
+    EXPECT_FALSE(container.hasInstance(lez.address()));
+    EXPECT_TRUE(container.hasInstance(paradox.address()));
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_RejectsDuplicateAddressWithoutReplacement) {
+    const LogosCore::ModuleDescriptor descriptor = scopedDescriptor("zone_0101");
+    LogosCore::LoadedModuleHandle first;
+    LogosCore::LoadedModuleHandle duplicate;
+
+    ASSERT_TRUE(launchFakeInstance(container, descriptor, first));
+    EXPECT_FALSE(launchFakeInstance(container, descriptor, duplicate));
+    EXPECT_TRUE(container.hasInstance(descriptor.address()));
+    EXPECT_EQ(container.instancePid(descriptor.address()),
+              std::optional<int64_t>{first.pid});
+    EXPECT_EQ(container.getAllInstancePids().size(), 1u);
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_ConcurrentDuplicateStartsOnlyOneProcess) {
+    const LogosCore::ModuleDescriptor descriptor = scopedDescriptor("zone_0101");
+    std::mutex mutex;
+    std::condition_variable condition;
+    unsigned int ready = 0;
+    bool start = false;
+    bool results[2] = {false, false};
+
+    const auto launch = [&](unsigned int index) {
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            ++ready;
+            condition.notify_all();
+            condition.wait(lock, [&]() { return start; });
+        }
+
+        LogosCore::LoadedModuleHandle handle;
+        results[index] = launchFakeInstance(container, descriptor, handle);
+    };
+
+    std::thread first(launch, 0);
+    std::thread second(launch, 1);
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return ready == 2;
+        }));
+        start = true;
+    }
+    condition.notify_all();
+    first.join();
+    second.join();
+
+    EXPECT_NE(results[0], results[1]);
+    EXPECT_TRUE(container.hasInstance(descriptor.address()));
+    EXPECT_EQ(container.getAllInstancePids().size(), 1u);
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_RoutesTokensToMatchingInstance) {
+    const LogosCore::ModuleDescriptor lez = scopedDescriptor("zone_0101");
+    const LogosCore::ModuleDescriptor paradox = scopedDescriptor("zone_8888");
+    LogosCore::LoadedModuleHandle lezHandle;
+    LogosCore::LoadedModuleHandle paradoxHandle;
+    std::atomic<unsigned int> unexpectedTerminations{0};
+    const auto onTerminated = [&](const LogosCore::ModuleAddress&) {
+        unexpectedTerminations.fetch_add(1);
+    };
+
+    ASSERT_TRUE(container.launchInstance(
+        lez, "/bin/sh",
+        {"-c", "read token; test \"$token\" = \"lez-token\" || exit 91; exec sleep 5"},
+        onTerminated, lezHandle));
+    ASSERT_TRUE(container.launchInstance(
+        paradox, "/bin/sh",
+        {"-c", "read token; test \"$token\" = \"paradox-token\" || exit 92; exec sleep 5"},
+        onTerminated, paradoxHandle));
+
+    ASSERT_TRUE(container.sendTokenToInstance(paradox.address(), "paradox-token"));
+    ASSERT_TRUE(container.sendTokenToInstance(lez.address(), "lez-token"));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    EXPECT_EQ(unexpectedTerminations.load(), 0u);
+    EXPECT_TRUE(container.hasInstance(lez.address()));
+    EXPECT_TRUE(container.hasInstance(paradox.address()));
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_CrashRemovesOnlyMatchingAddress) {
+    const LogosCore::ModuleDescriptor crashing = scopedDescriptor("zone_0101");
+    const LogosCore::ModuleDescriptor surviving = scopedDescriptor("zone_8888");
+    LogosCore::LoadedModuleHandle crashingHandle;
+    LogosCore::LoadedModuleHandle survivingHandle;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::vector<LogosCore::ModuleAddress> terminated;
+    const auto onTerminated = [&](const LogosCore::ModuleAddress& address) {
+        std::lock_guard<std::mutex> lock(mutex);
+        terminated.push_back(address);
+        condition.notify_all();
+    };
+
+    ASSERT_TRUE(container.launchInstance(
+        crashing, "/bin/sh", {"-c", "kill -SEGV $$"}, onTerminated, crashingHandle));
+    ASSERT_TRUE(launchFakeInstance(container, surviving, survivingHandle, onTerminated));
+
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+        return !terminated.empty();
+    }));
+    ASSERT_EQ(terminated.size(), 1u);
+    EXPECT_EQ(terminated.front(), crashing.address());
+
+    lock.unlock();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (container.hasInstance(crashing.address())
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(container.hasInstance(crashing.address()));
+    EXPECT_TRUE(container.hasInstance(surviving.address()));
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_RelaunchDoesNotLoseNewProcess) {
+    const LogosCore::ModuleDescriptor descriptor = scopedDescriptor("zone_0101");
+    LogosCore::LoadedModuleHandle first;
+    LogosCore::LoadedModuleHandle second;
+
+    ASSERT_TRUE(launchFakeInstance(container, descriptor, first));
+    ASSERT_TRUE(container.terminateInstance(descriptor.address()));
+    ASSERT_TRUE(launchFakeInstance(container, descriptor, second));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_TRUE(container.hasInstance(descriptor.address()));
+    EXPECT_EQ(container.instancePid(descriptor.address()),
+              std::optional<int64_t>{second.pid});
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_CompletionCannotRaceReplacement) {
+    const LogosCore::ModuleDescriptor descriptor = scopedDescriptor("zone_0101");
+    LogosCore::LoadedModuleHandle exiting;
+    LogosCore::LoadedModuleHandle replacement;
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool callbackEntered = false;
+    bool allowCallbackReturn = false;
+
+    ASSERT_TRUE(container.launchInstance(
+        descriptor, "/bin/sh", {"-c", "exit 0"},
+        [&](const LogosCore::ModuleAddress&) {
+            std::unique_lock<std::mutex> lock(mutex);
+            callbackEntered = true;
+            condition.notify_all();
+            condition.wait(lock, [&]() { return allowCallbackReturn; });
+        },
+        exiting));
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(condition.wait_for(lock, std::chrono::seconds(5), [&]() {
+            return callbackEntered;
+        }));
+    }
+
+    EXPECT_FALSE(launchFakeInstance(container, descriptor, replacement));
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        allowCallbackReturn = true;
+    }
+    condition.notify_all();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (container.hasInstance(descriptor.address())
+           && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(container.hasInstance(descriptor.address()));
+    EXPECT_TRUE(launchFakeInstance(container, descriptor, replacement));
+}
+
+TEST_F(SubprocessContainerTest, LaunchInstance_RejectsInvalidAddress) {
+    LogosCore::ModuleDescriptor descriptor = scopedDescriptor("zone/0101");
+    LogosCore::LoadedModuleHandle handle;
+
+    EXPECT_FALSE(launchFakeInstance(container, descriptor, handle));
+    EXPECT_FALSE(container.hasInstance(descriptor.address()));
 }
 
 // ---------------------------------------------------------------------------
