@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <vector>
 
-class SubprocessContainer : public LogosCore::ModuleContainer {
+class SubprocessContainer : public LogosCore::InstanceAwareModuleContainer {
 public:
     struct ProcessCallbacks {
         std::function<void(const std::string& name, int exitCode, bool crashed)> onFinished;
@@ -45,6 +45,19 @@ public:
     bool hasModule(const std::string& name) const override;
     std::optional<int64_t> pid(const std::string& name) const override;
     std::unordered_map<std::string, int64_t> getAllPids() const override;
+
+    bool launchInstance(const LogosCore::ModuleDescriptor& desc,
+                        const std::string& hostBinary,
+                        const std::vector<std::string>& args,
+                        std::function<void(const LogosCore::ModuleAddress&)> onTerminated,
+                        LogosCore::LoadedModuleHandle& out) override;
+    bool sendTokenToInstance(const LogosCore::ModuleAddress& address,
+                             const std::string& token) override;
+    bool terminateInstance(const LogosCore::ModuleAddress& address) override;
+    bool hasInstance(const LogosCore::ModuleAddress& address) const override;
+    std::optional<int64_t> instancePid(const LogosCore::ModuleAddress& address) const override;
+    std::unordered_map<LogosCore::ModuleAddress, int64_t, LogosCore::ModuleAddressHash>
+    getAllInstancePids() const override;
 
     // -- Low-level static process management (used by tests / qt_test_adapter) --
     static bool startProcess(const std::string& name, const std::string& executable,
