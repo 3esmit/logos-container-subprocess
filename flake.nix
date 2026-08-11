@@ -5,6 +5,10 @@
     logos-nix.url = "github:logos-co/logos-nix";
     nixpkgs.follows = "logos-nix/nixpkgs";
     logos-container.url = "github:logos-co/logos-container";
+    # Without this, logos-container resolves its OWN pinned logos-nix, so
+    # overriding logos-nix here (as the workspace and the Windows work both do)
+    # silently would not reach it.
+    logos-container.inputs.logos-nix.follows = "logos-nix";
   };
 
   outputs = { self, nixpkgs, logos-nix, logos-container }:
@@ -15,9 +19,23 @@
         pkgs = import nixpkgs { inherit system; };
         logosContainer = logos-container.packages.${system}.default;
       });
+
+      # Same, plus the "x86_64-windows" pseudo-system. Not logos-nix's shared
+      # forAllTargets, because this flake also threads logosContainer through
+      # -- and that dependency follows the TARGET (it is a header-only
+      # contract compiled into this library, not a tool run at build time).
+      forAllTargets = f:
+        nixpkgs.lib.genAttrs (systems ++ [ "x86_64-windows" ]) (system: f {
+          inherit system;
+          pkgs =
+            if system == "x86_64-windows"
+            then logos-nix.lib.mkWindowsPkgs { buildSystem = "x86_64-linux"; }
+            else import nixpkgs { inherit system; };
+          logosContainer = logos-container.packages.${system}.default;
+        });
     in
     {
-      packages = forAllSystems ({ pkgs, system, logosContainer }:
+      packages = forAllTargets ({ pkgs, system, logosContainer, ... }:
         let
           common = import ./nix/default.nix { inherit pkgs logosContainer; };
           src = ./.;
