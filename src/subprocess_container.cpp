@@ -12,6 +12,10 @@
 #include <boost/process/v2/stdio.hpp>
 
 #include <spdlog/spdlog.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 #include <array>
@@ -85,6 +89,11 @@ struct ProcessEntry {
     std::string                               err_line_buf;
     std::atomic<bool>                         exited{false};
     std::atomic<bool>                         cancelled{false};
+#ifdef _WIN32
+    // Needed to ask the child to quit: see requestGracefulExit(). Zero if the
+    // launcher never reported one, in which case we fall back to terminate().
+    DWORD                                     main_thread_id{0};
+#endif
 
     ProcessEntry(bp2::process proc,
                  asio::readable_pipe out_rp, asio::readable_pipe err_rp,
@@ -291,6 +300,33 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
                 } else if (WIFEXITED(raw_status)) {
                     exit_code = WEXITSTATUS(raw_status);
                 }
+#elif defined(_WIN32)
+                // Windows has no wait-status encoding: the raw value IS the
+                // exit code. Without this branch `crashed` stayed false for
+                // every child, so `logosctl status` reported an empty
+                // crash_signal even for a module that died on an access
+                // violation.
+                //
+                // There is no signal to report, so treat the standard
+                // fatal-exception status codes as a crash. These are the
+                // NTSTATUS values the OS uses when it kills a process, all of
+                // which have the severity bits set (0xC0000000).
+                switch (static_cast<unsigned long>(raw_status)) {
+                    case 0xC0000005ul:  // ACCESS_VIOLATION
+                    case 0xC000001Dul:  // ILLEGAL_INSTRUCTION
+                    case 0xC0000025ul:  // NONCONTINUABLE_EXCEPTION
+                    case 0xC0000026ul:  // INVALID_DISPOSITION
+                    case 0xC000008Cul:  // ARRAY_BOUNDS_EXCEEDED
+                    case 0xC0000094ul:  // INTEGER_DIVIDE_BY_ZERO
+                    case 0xC0000096ul:  // PRIVILEGED_INSTRUCTION
+                    case 0xC00000FDul:  // STACK_OVERFLOW
+                    case 0xC0000409ul:  // STACK_BUFFER_OVERRUN / __fastfail
+                    case 0xC0000374ul:  // HEAP_CORRUPTION
+                        crashed = true;
+                        break;
+                    default:
+                        break;
+                }
 #endif
                 entry->callbacks.onFinished(entry->name, exit_code, crashed);
             }
@@ -307,6 +343,88 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
                 s_processes.erase(current);
         });
 }
+
+#ifdef _WIN32
+// ---------------------------------------------------------------------------
+// Windows child-process plumbing
+//
+// Two POSIX mechanisms this container relies on have no direct Win32
+// equivalent, and both are handled here.
+//
+// 1. GRACEFUL EXIT. bp2's process::request_exit() is, on Windows,
+//    EnumWindows + SendMessageW(WM_CLOSE) (boost/process src/detail/
+//    process_handle_windows.cpp). EnumWindows only visits TOP-LEVEL WINDOWS,
+//    and a module host is a windowless QCoreApplication, so no HWND ever
+//    matches its pid: the callback never fires, EnumWindows returns success,
+//    and request_exit reports NO ERROR while doing nothing at all. Every
+//    module would then burn the full 5s grace period and be TerminateProcess'd,
+//    skipping the destructor chain that unlinks its QtRO endpoint.
+//
+//    The working equivalent is PostThreadMessage(WM_QUIT) to the child's MAIN
+//    thread, because Qt's own Win32 dispatcher turns that into
+//    QCoreApplication::quit() (qeventdispatcher_win.cpp: "else if
+//    (msg.message == WM_QUIT) ... instance()->quit()"), which is precisely
+//    what the POSIX build's SIGTERM self-pipe achieves. That needs the child's
+//    thread id, which bp2 discards -- hence the launcher hook below.
+//
+// 2. ORPHAN REAPING. There is no prctl(PR_SET_PDEATHSIG). The Win32 answer is
+//    a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: children assigned
+//    to it die when the last handle to the job closes, which happens
+//    automatically when this process exits -- crash included. One job for the
+//    whole container, created on first use.
+// ---------------------------------------------------------------------------
+
+HANDLE containerJob() {
+    static HANDLE job = [] () -> HANDLE {
+        HANDLE h = ::CreateJobObjectW(nullptr, nullptr);
+        if (h == nullptr) {
+            spdlog::warn("CreateJobObject failed ({}); orphaned module processes "
+                         "will not be reaped if this process dies abruptly",
+                         ::GetLastError());
+            return nullptr;
+        }
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!::SetInformationJobObject(h, JobObjectExtendedLimitInformation,
+                                       &li, sizeof(li))) {
+            spdlog::warn("SetInformationJobObject failed ({}); continuing without "
+                         "kill-on-close", ::GetLastError());
+        }
+        return h;
+    }();
+    return job;
+}
+
+// bp2 initializer. on_setup runs before CreateProcessW, on_success after it
+// and -- importantly -- BEFORE the launcher closes hThread, which is the only
+// window in which the thread id and thread handle are still available.
+struct WindowsChildSetup {
+    DWORD* out_thread_id;
+
+    template <typename Launcher>
+    boost::system::error_code on_setup(Launcher& l, const bp2::filesystem::path&,
+                                       std::wstring&) {
+        // Start suspended so the child is assigned to the job BEFORE it can
+        // run and spawn any grandchildren of its own; otherwise those escape.
+        l.creation_flags |= CREATE_SUSPENDED;
+        return {};
+    }
+
+    template <typename Launcher>
+    void on_success(Launcher& l, const bp2::filesystem::path&, std::wstring&) {
+        const PROCESS_INFORMATION& pi = l.process_information;
+        if (HANDLE job = containerJob())
+            if (!::AssignProcessToJobObject(job, pi.hProcess))
+                spdlog::warn("AssignProcessToJobObject failed ({})", ::GetLastError());
+        if (out_thread_id) *out_thread_id = pi.dwThreadId;
+        // Undo CREATE_SUSPENDED. If this fails the child never runs, so log
+        // loudly rather than leaving a mystery hang.
+        if (::ResumeThread(pi.hThread) == static_cast<DWORD>(-1))
+            spdlog::error("ResumeThread failed ({}); child will not start",
+                          ::GetLastError());
+    }
+};
+#endif  // _WIN32
 
 // ---------------------------------------------------------------------------
 // Synchronous kill
@@ -328,12 +446,24 @@ void syncKill(std::shared_ptr<ProcessEntry> entry) {
         // was delivered, this gives it EOF on fd 0 so a blocking token read
         // returns instead of hanging until the wait deadline.
         entry->in_pipe.close(ec);
+#ifndef _WIN32
         entry->process.request_exit(ec);
+#endif
     });
 
     // A lifecycle callback runs on the same io_context thread as
     // async_wait. Returning lets that wait handler observe the exit; blocking
     // here would prevent it from ever running.
+#ifdef _WIN32
+    if (entry->main_thread_id != 0) {
+        if (!::PostThreadMessageW(entry->main_thread_id, WM_QUIT, 0, 0))
+            spdlog::warn("PostThreadMessage(WM_QUIT) failed for {} ({}); "
+                         "falling back to terminate", entry->name, ::GetLastError());
+    } else {
+        spdlog::warn("No main thread id recorded for {}; cannot request a "
+                     "graceful exit, will terminate", entry->name);
+    }
+#endif
     if (ioRuntime().thread.get_id() == std::this_thread::get_id()) return;
 
     auto wait = [&](std::chrono::milliseconds budget) -> bool {
@@ -426,8 +556,17 @@ bool startProcessAtAddress(const LogosCore::ModuleAddress& address,
     pstdio.out = out_wpipe;
     pstdio.err = err_wpipe;
 
+#ifdef _WIN32
+    // Start suspended so the child enters the container job before it can
+    // spawn grandchildren, and retain its main thread id for WM_QUIT.
+    DWORD childMainThread = 0;
+    bp2::process process = bp2::default_process_launcher()(
+        rt.ctx, ec, executable, arguments, pstdio,
+        WindowsChildSetup{&childMainThread});
+#else
     bp2::process process = bp2::default_process_launcher()(
         rt.ctx, ec, executable, arguments, pstdio);
+#endif
 
     out_wpipe.close();
     err_wpipe.close();
@@ -443,6 +582,9 @@ bool startProcessAtAddress(const LogosCore::ModuleAddress& address,
     auto entry = std::make_shared<ProcessEntry>(
         std::move(process), std::move(out_rpipe), std::move(err_rpipe),
         std::move(in_wpipe), address, callbacks);
+#ifdef _WIN32
+    entry->main_thread_id = childMainThread;
+#endif
     bool accepted = false;
     {
         std::lock_guard<std::mutex> lock(s_processesMutex);

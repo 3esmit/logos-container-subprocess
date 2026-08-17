@@ -18,4 +18,9 @@ target_include_directories(logos_container_subprocess_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
-gtest_discover_tests(logos_container_subprocess_tests)
+# DISCOVERY_MODE PRE_TEST: the default (POST_BUILD) RUNS the test binary at
+# build time to enumerate cases, which is impossible when cross-compiling --
+# the build host cannot execute a PE, and the attempt fails obscurely with
+# "logos_container_subprocess_tests.exe: line 2: syntax error". PRE_TEST defers
+# enumeration to ctest time; native behaviour is unchanged.
+gtest_discover_tests(logos_container_subprocess_tests DISCOVERY_MODE PRE_TEST)
