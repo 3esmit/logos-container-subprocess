@@ -34,6 +34,6 @@
 
   meta = with pkgs.lib; {
     description = "Subprocess container: process-isolated ModuleContainer implementation for the Logos module runtime";
-    platforms = platforms.unix;
+    platforms = platforms.unix ++ platforms.windows;
   };
 }
