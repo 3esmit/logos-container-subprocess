@@ -1,0 +1,32 @@
+name: Windows
+
+# The entire per-repo cost of Windows CI. The Nix install and cache, the
+# target-existence guard, the cold-cache refusal, the PE-format gate, the
+# artifact hand-off and its round-trip check all live once in
+# logos-co/logos-windows-ci.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  windows:
+    uses: logos-co/logos-windows-ci/.github/workflows/windows-ci.yml@v1
+    secrets: inherit
+    with:
+      targets: default
+      # This repo ships one static library and a header (liblogos_container_subprocess.a) -- no .exe and no .dll -- so the
+      # default floor of one loose PE would refuse a perfectly good tree.
+      # Measured on the Linux builder against this repo's own master, which is
+      # why the archive floor is a number rather than a guess.
+      min-pes: 0
+      min-archives: 1
+      # NO SMOKE, and that is reported as a coverage gap rather than a pass.
+      # There is nothing here to execute: a static library and its headers have
+      # no entry point. What this job buys is that the cross-build succeeds and
+      # that the archives are real mingw COFF rather than host objects with the
+      # right extension -- which is a defect this project has actually shipped.
+      # Anything stronger needs a consumer to link against it, and that belongs
+      # in the consumer's job.
