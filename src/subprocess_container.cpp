@@ -532,7 +532,12 @@ struct WindowsChildSetup {
                                        std::wstring&) {
         // Start suspended so the child is assigned to the job BEFORE it can
         // run and spawn any grandchildren of its own; otherwise those escape.
-        l.creation_flags |= CREATE_SUSPENDED;
+        //
+        // CREATE_NO_WINDOW because logos_host is a console-subsystem PE: when
+        // the parent has no console of its own -- a GUI Basecamp, or the
+        // DETACHED_PROCESS logosctl daemon -- Windows gives each child a fresh
+        // console WINDOW. stdio is already on pipes, so this costs no output.
+        l.creation_flags |= CREATE_SUSPENDED | CREATE_NO_WINDOW;
         return {};
     }
 
