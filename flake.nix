@@ -4,7 +4,7 @@
   inputs = {
     logos-nix.url = "github:logos-co/logos-nix";
     nixpkgs.follows = "logos-nix/nixpkgs";
-    logos-container.url = "github:3esmit/logos-container";
+    logos-container.url = "github:3esmit/logos-container?rev=c211935f732540f81fe9da6c3522db1c5979302d";
     # Without this, logos-container resolves its OWN pinned logos-nix, so
     # overriding logos-nix here (as the workspace and the Windows work both do)
     # silently would not reach it.

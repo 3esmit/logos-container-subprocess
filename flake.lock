@@ -12,16 +12,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1786888101,
-        "narHash": "sha256-9YpIisiTHBen7S3EF2sGFCVTvF+qo61ERXqPnVBnirk=",
+        "lastModified": 1789693006,
+        "narHash": "sha256-b4kaY8bZ0VWtTRA9xD73e2Mk2pGtQIApydiTdOQpLj4=",
         "owner": "3esmit",
         "repo": "logos-container",
-        "rev": "a8eb5dddce34541abaeb213efcd61657cb924b37",
+        "rev": "c211935f732540f81fe9da6c3522db1c5979302d",
         "type": "github"
       },
       "original": {
         "owner": "3esmit",
         "repo": "logos-container",
+        "rev": "c211935f732540f81fe9da6c3522db1c5979302d",
         "type": "github"
       }
     },
