@@ -1,7 +1,9 @@
 #ifndef SUBPROCESS_CONTAINER_H
 #define SUBPROCESS_CONTAINER_H
 
+#include <logos_container/load_status.h>
 #include <logos_container/module_container.h>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -40,6 +42,11 @@ public:
                 std::function<void(const std::string&)> onTerminated,
                 LogosCore::LoadedModuleHandle& out) override;
     bool sendToken(const std::string& name, const std::string& token) override;
+    LogosCore::LoadOutcome awaitLoad(const std::string& name,
+                                     std::chrono::milliseconds timeout) override;
+    LogosCore::LoadOutcome awaitLoadInstance(
+        const LogosCore::ModuleAddress& address,
+        std::chrono::milliseconds timeout) override;
     void terminate(const std::string& name) override;
     void terminateAll() override;
     bool hasModule(const std::string& name) const override;

@@ -639,3 +639,117 @@ TEST_F(SubprocessContainerTest, Terminate_NoopForUnknown) {
     container.terminate("nonexistent");
     SUCCEED();
 }
+
+namespace {
+
+LogosCore::LoadOutcome awaitAfterLaunch(SubprocessContainer& c, const char* name,
+                                        const std::string& script,
+                                        std::chrono::milliseconds timeout,
+                                        std::chrono::milliseconds& elapsed)
+{
+    LogosCore::ModuleDescriptor desc;
+    desc.name = name;
+    LogosCore::LoadedModuleHandle handle;
+    if (!c.launch(desc, "/bin/sh", {"-c", script}, nullptr, handle))
+        return {LogosCore::LoadVerdict::Failed, "launch failed"};
+
+    const auto start = std::chrono::steady_clock::now();
+    const LogosCore::LoadOutcome outcome = c.awaitLoad(name, timeout);
+    elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    return outcome;
+}
+
+} // namespace
+
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsLoadedWhenTheChildSaysSo) {
+    std::chrono::milliseconds elapsed{};
+    const auto outcome = awaitAfterLaunch(
+        container, "ok_mod", "printf '%s\\n' '@logos-load-status ok'; exec sleep 5",
+        std::chrono::seconds(5), elapsed);
+
+    EXPECT_EQ(outcome.verdict, LogosCore::LoadVerdict::Loaded);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_CarriesTheReasonTheChildReported) {
+    std::chrono::milliseconds elapsed{};
+    const auto outcome = awaitAfterLaunch(
+        container, "failed_mod",
+        "printf '%s\\n' '@logos-load-status failed undefined symbol: logos_module_install'; exit 1",
+        std::chrono::seconds(5), elapsed);
+
+    EXPECT_EQ(outcome.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_NE(outcome.reason.find("undefined symbol: logos_module_install"),
+              std::string::npos);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureWhenTheChildJustDies) {
+    std::chrono::milliseconds elapsed{};
+    const auto outcome = awaitAfterLaunch(container, "dead_mod", "exit 3",
+                                          std::chrono::seconds(5), elapsed);
+
+    EXPECT_EQ(outcome.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_NE(outcome.reason.find("3"), std::string::npos);
+    EXPECT_LT(elapsed, std::chrono::seconds(4));
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsUnknownForASilentLiveChild) {
+    std::chrono::milliseconds elapsed{};
+    const auto outcome = awaitAfterLaunch(container, "silent_mod", "exec sleep 5",
+                                          std::chrono::milliseconds(300), elapsed);
+
+    EXPECT_EQ(outcome.verdict, LogosCore::LoadVerdict::Unknown);
+    EXPECT_TRUE(outcome.reason.empty());
+    EXPECT_GE(elapsed, std::chrono::milliseconds(250));
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_ReportsFailureForAModuleThatWasNeverLaunched) {
+    const auto outcome = container.awaitLoad("never_launched", std::chrono::milliseconds(10));
+    EXPECT_EQ(outcome.verdict, LogosCore::LoadVerdict::Failed);
+    EXPECT_FALSE(outcome.reason.empty());
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoad_StatusLineIsNotRelayedAsModuleOutput) {
+    std::mutex mutex;
+    std::vector<std::string> lines;
+    SubprocessContainer::ProcessCallbacks callbacks;
+    callbacks.onOutput = [&](const std::string&, const std::string& line, bool) {
+        std::lock_guard<std::mutex> lock(mutex);
+        lines.push_back(line);
+    };
+
+    ASSERT_TRUE(SubprocessContainer::startProcess(
+        "quiet_mod", "/bin/sh",
+        {"-c", "printf '%s\\n' '@logos-load-status ok' 'hello'; exec sleep 5"},
+        callbacks));
+
+    const auto outcome = container.awaitLoad("quiet_mod", std::chrono::seconds(5));
+    ASSERT_EQ(outcome.verdict, LogosCore::LoadVerdict::Loaded);
+
+    for (int i = 0; i < 100; ++i) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!lines.empty()) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(lines, std::vector<std::string>{"hello"});
+}
+
+TEST_F(SubprocessContainerTest, AwaitLoadInstance_UsesExactScopedAddress) {
+    const auto descriptor = scopedDescriptor("zone_0101");
+    LogosCore::LoadedModuleHandle handle;
+    ASSERT_TRUE(container.launchInstance(
+        descriptor, "/bin/sh",
+        {"-c", "printf '%s\\n' '@logos-load-status ok'; exec sleep 5"},
+        {}, handle));
+
+    const auto outcome = container.awaitLoadInstance(
+        descriptor.address(), std::chrono::seconds(5));
+    EXPECT_EQ(outcome.verdict, LogosCore::LoadVerdict::Loaded);
+    EXPECT_EQ(container.awaitLoad("lez_indexer_module", std::chrono::milliseconds{1}).verdict,
+              LogosCore::LoadVerdict::Failed);
+}

@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -66,6 +67,29 @@ IoRuntime& ioRuntime() {
     return s_runtime;
 }
 
+#ifndef _WIN32
+// Module hosts arm PR_SET_PDEATHSIG. The signal is tied to the thread that
+// spawned the child, so launching from a caller thread would kill an otherwise
+// healthy host when that caller returns. Keep one process-lifetime spawn
+// thread; its intentionally leaked lifetime matches the host process.
+struct SpawnRuntime {
+    asio::io_context ctx;
+    asio::executor_work_guard<asio::io_context::executor_type> guard;
+    std::thread thread;
+
+    SpawnRuntime()
+        : guard(asio::make_work_guard(ctx))
+        , thread([this]() { ctx.run(); })
+    {}
+};
+
+SpawnRuntime& spawnRuntime()
+{
+    static SpawnRuntime* runtime = new SpawnRuntime;
+    return *runtime;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // ProcessEntry: owns one live child process and its read pipes.
 // ---------------------------------------------------------------------------
@@ -89,6 +113,16 @@ struct ProcessEntry {
     std::string                               err_line_buf;
     std::atomic<bool>                         exited{false};
     std::atomic<bool>                         cancelled{false};
+    // Set when stdout reaches EOF. Exit status and stdout must both be known
+    // before a silent child is classified as a failed load.
+    std::atomic<bool>                         out_eof{false};
+
+    // Child load verdict and the bounded wait used by awaitLoad().
+    std::mutex                                status_mutex;
+    std::condition_variable                   status_cv;
+    std::optional<LogosCore::LoadOutcome>     status;
+    int                                       exit_code{0};
+    bool                                      exit_crashed{false};
 #ifdef _WIN32
     // Needed to ask the child to quit: see requestGracefulExit(). Zero if the
     // launcher never reported one, in which case we fall back to terminate().
@@ -159,6 +193,41 @@ ProcessMap s_processes;
 AddressSet s_launchingAddresses;
 std::mutex s_processesMutex;
 
+#ifndef _WIN32
+struct SpawnState {
+    std::mutex mutex;
+    std::condition_variable completed;
+    bool done{false};
+    boost::system::error_code error;
+    std::unique_ptr<bp2::process> process;
+};
+
+std::unique_ptr<bp2::process> spawnOnLifetimeThread(
+    const std::string& executable,
+    const std::vector<std::string>& arguments,
+    bp2::process_stdio stdio,
+    boost::system::error_code& error)
+{
+    auto state = std::make_shared<SpawnState>();
+    asio::post(spawnRuntime().ctx,
+               [state, executable, arguments, stdio = std::move(stdio)]() mutable {
+                   state->process = std::make_unique<bp2::process>(
+                       bp2::default_process_launcher()(
+                           spawnRuntime().ctx, state->error, executable, arguments, stdio));
+                   {
+                       std::lock_guard<std::mutex> lock(state->mutex);
+                       state->done = true;
+                   }
+                   state->completed.notify_one();
+               });
+
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->completed.wait(lock, [&state] { return state->done; });
+    error = state->error;
+    return std::move(state->process);
+}
+#endif
+
 LogosCore::ModuleAddress defaultAddress(const std::string& moduleName)
 {
     return {moduleName, {}};
@@ -215,6 +284,63 @@ IoRuntime::~IoRuntime() {
 
 void scheduleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr);
 
+void settleLoadStatus(ProcessEntry& entry, LogosCore::LoadOutcome outcome)
+{
+    {
+        std::lock_guard<std::mutex> lock(entry.status_mutex);
+        if (entry.status.has_value()) return;
+        entry.status = std::move(outcome);
+    }
+    entry.status_cv.notify_all();
+}
+
+bool consumeLoadStatusLine(ProcessEntry& entry, const std::string& line)
+{
+    const std::string prefix(LogosCore::kLoadStatusPrefix);
+    if (line.rfind(prefix, 0) != 0) return false;
+
+    std::string rest = line.substr(prefix.size());
+    const std::size_t start = rest.find_first_not_of(" \t");
+    rest = start == std::string::npos ? std::string() : rest.substr(start);
+
+    if (rest == LogosCore::kLoadStatusOk) {
+        settleLoadStatus(entry, {LogosCore::LoadVerdict::Loaded, {}});
+        return true;
+    }
+
+    const std::string failed(LogosCore::kLoadStatusFailed);
+    if (rest.rfind(failed, 0) == 0) {
+        std::string reason = rest.substr(failed.size());
+        const std::size_t first = reason.find_first_not_of(" \t");
+        reason = first == std::string::npos ? std::string() : reason.substr(first);
+        if (reason.empty()) reason = "the module host reported a load failure";
+        settleLoadStatus(entry, {LogosCore::LoadVerdict::Failed, std::move(reason)});
+        return true;
+    }
+
+    // Consume unknown versions of the status line, but do not expose the
+    // protocol marker as ordinary module output.
+    spdlog::debug("Unrecognised load-status line from {}: {}", entry.name, line);
+    return true;
+}
+
+void maybeSettleExitAsFailure(ProcessEntry& entry)
+{
+    if (!entry.exited.load() || !entry.out_eof.load()) return;
+
+    std::string reason;
+    if (entry.cancelled.load()) {
+        reason = "the module process was terminated before it reported that it had loaded";
+    } else if (entry.exit_crashed) {
+        reason = "the module process died on signal " + std::to_string(entry.exit_code)
+               + " before it reported that it had loaded";
+    } else {
+        reason = "the module process exited with code " + std::to_string(entry.exit_code)
+               + " before it reported that it had loaded";
+    }
+    settleLoadStatus(entry, {LogosCore::LoadVerdict::Failed, std::move(reason)});
+}
+
 void handleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr,
                 const boost::system::error_code& ec, std::size_t n)
 {
@@ -236,7 +362,8 @@ void handleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr,
         while ((nl = line_buf.find('\n', search)) != std::string::npos) {
             std::string line = line_buf.substr(pos, nl - pos);
             if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (!line.empty() && entry->callbacks.onOutput)
+            if (!line.empty() && !consumeLoadStatusLine(*entry, line)
+                && entry->callbacks.onOutput)
                 entry->callbacks.onOutput(entry->name, line, isStderr);
             pos = nl + 1;
             search = pos;
@@ -260,12 +387,17 @@ void handleRead(std::shared_ptr<ProcessEntry> entry, bool isStderr,
     if (!ec) {
         scheduleRead(std::move(entry), isStderr);
     } else {
-        if (!line_buf.empty() && entry->callbacks.onOutput) {
+        if (!line_buf.empty()) {
             if (line_buf.back() == '\r') line_buf.pop_back();
-            if (!line_buf.empty())
+            if (!line_buf.empty() && !consumeLoadStatusLine(*entry, line_buf)
+                && entry->callbacks.onOutput)
                 entry->callbacks.onOutput(entry->name, line_buf, isStderr);
         }
         line_buf.clear();
+        if (!isStderr) {
+            entry->out_eof.store(true);
+            maybeSettleExitAsFailure(*entry);
+        }
     }
 }
 
@@ -288,46 +420,40 @@ void scheduleWait(std::shared_ptr<ProcessEntry> entry) {
     auto* e = entry.get();
     e->process.async_wait(
         [entry = std::move(entry)](const boost::system::error_code& /*ec*/, int raw_status) mutable {
+            bool crashed = false;
+            int exit_code = raw_status;
+#if defined(WIFEXITED)
+            const auto native = entry->process.native_exit_code();
+            if (WIFSIGNALED(native)) {
+                crashed = true;
+                exit_code = WTERMSIG(native);
+            } else if (WIFEXITED(native)) {
+                exit_code = WEXITSTATUS(native);
+            }
+#elif defined(_WIN32)
+            switch (static_cast<unsigned long>(raw_status)) {
+                case 0xC0000005ul: // ACCESS_VIOLATION
+                case 0xC000001Dul: // ILLEGAL_INSTRUCTION
+                case 0xC0000025ul: // NONCONTINUABLE_EXCEPTION
+                case 0xC0000026ul: // INVALID_DISPOSITION
+                case 0xC000008Cul: // ARRAY_BOUNDS_EXCEEDED
+                case 0xC0000094ul: // INTEGER_DIVIDE_BY_ZERO
+                case 0xC0000096ul: // PRIVILEGED_INSTRUCTION
+                case 0xC00000FDul: // STACK_OVERFLOW
+                case 0xC0000409ul: // STACK_BUFFER_OVERRUN / __fastfail
+                case 0xC0000374ul: // HEAP_CORRUPTION
+                    crashed = true;
+                    break;
+                default:
+                    break;
+            }
+#endif
+            entry->exit_code = exit_code;
+            entry->exit_crashed = crashed;
             entry->exited.store(true);
+            maybeSettleExitAsFailure(*entry);
 
             if (!entry->cancelled.load() && entry->callbacks.onFinished) {
-                bool crashed = false;
-                int exit_code = raw_status;
-#if defined(WIFEXITED)
-                if (WIFSIGNALED(raw_status)) {
-                    crashed    = true;
-                    exit_code  = WTERMSIG(raw_status);
-                } else if (WIFEXITED(raw_status)) {
-                    exit_code = WEXITSTATUS(raw_status);
-                }
-#elif defined(_WIN32)
-                // Windows has no wait-status encoding: the raw value IS the
-                // exit code. Without this branch `crashed` stayed false for
-                // every child, so `logosctl status` reported an empty
-                // crash_signal even for a module that died on an access
-                // violation.
-                //
-                // There is no signal to report, so treat the standard
-                // fatal-exception status codes as a crash. These are the
-                // NTSTATUS values the OS uses when it kills a process, all of
-                // which have the severity bits set (0xC0000000).
-                switch (static_cast<unsigned long>(raw_status)) {
-                    case 0xC0000005ul:  // ACCESS_VIOLATION
-                    case 0xC000001Dul:  // ILLEGAL_INSTRUCTION
-                    case 0xC0000025ul:  // NONCONTINUABLE_EXCEPTION
-                    case 0xC0000026ul:  // INVALID_DISPOSITION
-                    case 0xC000008Cul:  // ARRAY_BOUNDS_EXCEEDED
-                    case 0xC0000094ul:  // INTEGER_DIVIDE_BY_ZERO
-                    case 0xC0000096ul:  // PRIVILEGED_INSTRUCTION
-                    case 0xC00000FDul:  // STACK_OVERFLOW
-                    case 0xC0000409ul:  // STACK_BUFFER_OVERRUN / __fastfail
-                    case 0xC0000374ul:  // HEAP_CORRUPTION
-                        crashed = true;
-                        break;
-                    default:
-                        break;
-                }
-#endif
                 entry->callbacks.onFinished(entry->name, exit_code, crashed);
             }
 
@@ -564,8 +690,8 @@ bool startProcessAtAddress(const LogosCore::ModuleAddress& address,
         rt.ctx, ec, executable, arguments, pstdio,
         WindowsChildSetup{&childMainThread});
 #else
-    bp2::process process = bp2::default_process_launcher()(
-        rt.ctx, ec, executable, arguments, pstdio);
+    auto process = spawnOnLifetimeThread(executable, arguments,
+                                         std::move(pstdio), ec);
 #endif
 
     out_wpipe.close();
@@ -579,8 +705,21 @@ bool startProcessAtAddress(const LogosCore::ModuleAddress& address,
         return false;
     }
 
+#ifndef _WIN32
+    if (!process) {
+        releaseReservation();
+        spdlog::error("Failed to start process for {}: launcher returned no process",
+                      addressLabel(address));
+        return false;
+    }
+#endif
+
     auto entry = std::make_shared<ProcessEntry>(
+#ifdef _WIN32
         std::move(process), std::move(out_rpipe), std::move(err_rpipe),
+#else
+        std::move(*process), std::move(out_rpipe), std::move(err_rpipe),
+#endif
         std::move(in_wpipe), address, callbacks);
 #ifdef _WIN32
     entry->main_thread_id = childMainThread;
@@ -745,6 +884,50 @@ bool SubprocessContainer::launch(const LogosCore::ModuleDescriptor& desc,
 bool SubprocessContainer::sendToken(const std::string& name, const std::string& token)
 {
     return sendTokenToInstance(defaultAddress(name), token);
+}
+
+namespace {
+
+LogosCore::LoadOutcome awaitLoadAtAddress(
+    const LogosCore::ModuleAddress& address, std::chrono::milliseconds timeout)
+{
+    std::shared_ptr<ProcessEntry> entry;
+    {
+        std::lock_guard<std::mutex> lock(s_processesMutex);
+        const auto current = s_processes.find(address);
+        if (current != s_processes.end()) entry = current->second;
+    }
+
+    // Once the entry is gone, the child cannot report a later successful load.
+    if (!entry) {
+        return {LogosCore::LoadVerdict::Failed,
+                "the module process exited before it reported that it had loaded"};
+    }
+
+    std::unique_lock<std::mutex> lock(entry->status_mutex);
+    entry->status_cv.wait_for(lock, timeout,
+                              [&entry] { return entry->status.has_value(); });
+    if (entry->status) return *entry->status;
+
+    // A silent live child is compatible with hosts predating the status line.
+    return {};
+}
+
+} // namespace
+
+LogosCore::LoadOutcome SubprocessContainer::awaitLoad(
+    const std::string& name, std::chrono::milliseconds timeout)
+{
+    return awaitLoadAtAddress(defaultAddress(name), timeout);
+}
+
+LogosCore::LoadOutcome SubprocessContainer::awaitLoadInstance(
+    const LogosCore::ModuleAddress& address, std::chrono::milliseconds timeout)
+{
+    if (!address.isValid()) {
+        return {LogosCore::LoadVerdict::Failed, "invalid module runtime address"};
+    }
+    return awaitLoadAtAddress(address, timeout);
 }
 
 void SubprocessContainer::terminate(const std::string& name)
